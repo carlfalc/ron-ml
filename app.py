@@ -768,6 +768,130 @@ def ingest_economic_calendar():
     return jsonify({"error": "Failed to fetch calendar"}), 500
 
 
+# ─── Alpha Vantage Economic Intelligence ─────────────────────
+ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "PDM6N3KVGIL3S8ZT")
+
+@app.route("/intelligence/economic", methods=["GET"])
+def economic_indicators():
+    """Fetch key economic indicators — Fed rate, CPI, unemployment, treasury, GDP."""
+    indicators = {}
+    endpoints = [
+        ("fed_funds_rate", "FEDERAL_FUNDS_RATE", {"interval": "monthly"}),
+        ("cpi", "CPI", {"interval": "monthly"}),
+        ("unemployment", "UNEMPLOYMENT", {}),
+        ("treasury_10y", "TREASURY_YIELD", {"interval": "daily", "maturity": "10year"}),
+        ("real_gdp", "REAL_GDP", {"interval": "quarterly"}),
+    ]
+    for name, func, extra_params in endpoints:
+        try:
+            params = {"function": func, "apikey": ALPHA_VANTAGE_KEY}
+            params.update(extra_params)
+            resp = requests.get("https://www.alphavantage.co/query", params=params)
+            if resp.status_code == 200:
+                data = resp.json().get("data", [])
+                if data:
+                    indicators[name] = {"value": data[0].get("value"), "date": data[0].get("date"),
+                        "previous": data[1].get("value") if len(data) > 1 else None}
+        except Exception as e:
+            logger.error(f"{name} error: {e}")
+
+    # Generate RON insight
+    parts = []
+    fed = indicators.get("fed_funds_rate", {})
+    if fed and fed.get("value") and fed.get("previous"):
+        direction = "rising" if float(fed["value"]) > float(fed["previous"]) else "falling"
+        parts.append(f"Fed rate {fed['value']}% ({direction}). {'Rising rates pressure gold, strengthen USD.' if direction == 'rising' else 'Falling rates support gold, weaken USD.'}")
+    cpi = indicators.get("cpi", {})
+    if cpi and cpi.get("value") and cpi.get("previous"):
+        parts.append(f"CPI {'rising — bullish gold, bearish equities' if float(cpi['value']) > float(cpi['previous']) else 'cooling — reduces rate hike urgency'}.")
+    unemp = indicators.get("unemployment", {})
+    if unemp and unemp.get("value"):
+        parts.append(f"Unemployment {unemp['value']}%.")
+
+    supabase_insert("insights", {"insight_type": "economic_indicators", "title": "Economic Update",
+        "description": json.dumps(indicators), "created_at": datetime.utcnow().isoformat()})
+
+    return jsonify({"indicators": indicators, "ron_insight": " ".join(parts), "fetched_at": datetime.utcnow().isoformat()})
+
+
+@app.route("/intelligence/sentiment", methods=["GET"])
+def market_sentiment():
+    """Fetch AI-powered news sentiment scores per instrument from Alpha Vantage."""
+    symbol = request.args.get("symbol", "")
+    av_map = {"XAUUSD": "FOREX:XAU", "US30": "DJI", "NAS100": "NDX", "AUDUSD": "FOREX:AUD",
+        "NZDUSD": "FOREX:NZD", "EURUSD": "FOREX:EUR", "GBPUSD": "FOREX:GBP", "USOIL": "CRUDE_OIL"}
+    tickers = av_map.get(symbol, symbol) if symbol else ",".join(av_map.values())
+
+    try:
+        resp = requests.get("https://www.alphavantage.co/query", params={
+            "function": "NEWS_SENTIMENT", "tickers": tickers, "limit": "20", "apikey": ALPHA_VANTAGE_KEY})
+        if resp.status_code == 200:
+            feed = resp.json().get("feed", [])
+            summary = {}
+            for article in feed:
+                for td in article.get("ticker_sentiment", []):
+                    t = td.get("ticker", "")
+                    score = float(td.get("ticker_sentiment_score", 0))
+                    if t not in summary:
+                        summary[t] = {"scores": [], "count": 0}
+                    summary[t]["scores"].append(score)
+                    summary[t]["count"] += 1
+            for t, d in summary.items():
+                avg = sum(d["scores"]) / len(d["scores"]) if d["scores"] else 0
+                d["avg_sentiment"] = round(avg, 4)
+                d["overall"] = "Bullish" if avg > 0.15 else ("Bearish" if avg < -0.15 else "Neutral")
+                d["strength"] = "Strong" if abs(avg) > 0.35 else ("Moderate" if abs(avg) > 0.15 else "Weak")
+                d["articles"] = d.pop("count")
+                del d["scores"]
+            return jsonify({"sentiment": summary, "articles_analysed": len(feed), "fetched_at": datetime.utcnow().isoformat()})
+    except Exception as e:
+        logger.error(f"Sentiment error: {e}")
+    return jsonify({"error": "Failed to fetch sentiment"}), 500
+
+
+@app.route("/intelligence/fear-greed", methods=["GET"])
+def fear_greed_index():
+    """Fetch CNN Fear & Greed Index. Extreme fear = buy, extreme greed = caution."""
+    try:
+        resp = requests.get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            fg = data.get("fear_and_greed", {})
+            score = fg.get("score", 50)
+            rating = fg.get("rating", "Neutral")
+            if score <= 25: signal = "EXTREME FEAR — strong buy signal historically. Markets oversold."
+            elif score <= 40: signal = "FEAR — look for buy opportunities on dips."
+            elif score <= 60: signal = "NEUTRAL — trade the technicals."
+            elif score <= 75: signal = "GREED — be selective, tighten stops."
+            else: signal = "EXTREME GREED — warning signal. Consider reducing exposure."
+            result = {"score": score, "rating": rating, "previous_close": fg.get("previous_close", 50),
+                "one_week_ago": fg.get("previous_1_week", 50), "one_month_ago": fg.get("previous_1_month", 50),
+                "ron_signal": signal, "fetched_at": datetime.utcnow().isoformat()}
+            supabase_insert("insights", {"insight_type": "fear_greed_index",
+                "title": f"Fear & Greed: {score} ({rating})", "description": json.dumps(result),
+                "created_at": datetime.utcnow().isoformat()})
+            return jsonify(result)
+    except Exception as e:
+        logger.error(f"Fear & Greed error: {e}")
+    return jsonify({"error": "Failed to fetch Fear & Greed Index"}), 500
+
+
+@app.route("/intelligence/full-briefing", methods=["GET"])
+def full_briefing():
+    """RON's complete intelligence briefing — all data sources combined."""
+    port = os.environ.get("PORT", 5000)
+    briefing = {"timestamp": datetime.utcnow().isoformat(), "sections": {}}
+    for name, path in [("economic", "/intelligence/economic"), ("fear_greed", "/intelligence/fear-greed"), ("sentiment", "/intelligence/sentiment")]:
+        try:
+            r = requests.get(f"http://localhost:{port}{path}")
+            briefing["sections"][name] = r.json() if r.status_code == 200 else {"status": "unavailable"}
+        except:
+            briefing["sections"][name] = {"status": "unavailable"}
+    briefing["ml_model_loaded"] = load_model() is not None
+    return jsonify(briefing)
+
+
 # ─── Main ────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
