@@ -538,6 +538,236 @@ def generate_reasoning(data, prediction, pattern_stats, session_stats) -> str:
     return " ".join(parts)
 
 
+# ─── Yahoo Finance Data Ingestion ────────────────────────────
+# Symbol mapping: GAINEDGE symbol → Yahoo Finance ticker
+YAHOO_SYMBOLS = {
+    "XAUUSD": "GC=F",          # Gold futures
+    "US30": "YM=F",             # Dow Jones futures
+    "NAS100": "NQ=F",           # Nasdaq futures
+    "NZDUSD": "NZDUSD=X",      # NZD/USD forex
+    "AUDUSD": "AUDUSD=X",      # AUD/USD forex
+    "EURUSD": "EURUSD=X",      # EUR/USD forex
+    "GBPUSD": "GBPUSD=X",      # GBP/USD forex
+    "USDJPY": "USDJPY=X",      # USD/JPY forex
+    "USDCHF": "USDCHF=X",      # USD/CHF forex
+    "USDCAD": "USDCAD=X",      # USD/CAD forex
+    "GBPJPY": "GBPJPY=X",      # GBP/JPY forex
+    "EURJPY": "EURJPY=X",      # EUR/JPY forex
+    "AUDJPY": "AUDJPY=X",      # AUD/JPY forex
+    "EURGBP": "EURGBP=X",      # EUR/GBP forex
+    "XAGUSD": "SI=F",          # Silver futures
+    "USOIL": "CL=F",           # Crude Oil WTI
+    "UKOIL": "BZ=F",           # Brent Oil
+    "HK50": "^HSI",            # Hang Seng Index
+    "GER40": "^GDAXI",         # DAX 40
+    "UK100": "^FTSE",          # FTSE 100
+    "JP225": "^N225",          # Nikkei 225
+    "US500": "^GSPC",          # S&P 500
+    "AUS200": "^AXJO",         # ASX 200
+}
+
+
+def fetch_yahoo_history(gainedge_symbol: str, period: str = "1y", interval: str = "1d") -> list:
+    """
+    Fetch historical OHLCV data from Yahoo Finance for a given instrument.
+    period: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, max
+    interval: 1m, 5m, 15m, 1h, 1d, 1wk, 1mo
+    """
+    import yfinance as yf
+
+    yahoo_ticker = YAHOO_SYMBOLS.get(gainedge_symbol)
+    if not yahoo_ticker:
+        logger.warning(f"No Yahoo Finance mapping for {gainedge_symbol}")
+        return []
+
+    try:
+        ticker = yf.Ticker(yahoo_ticker)
+        df = ticker.history(period=period, interval=interval)
+
+        if df.empty:
+            logger.warning(f"No data returned for {yahoo_ticker}")
+            return []
+
+        candles = []
+        for idx, row in df.iterrows():
+            candles.append({
+                "symbol": gainedge_symbol,
+                "timeframe": interval,
+                "timestamp": idx.isoformat(),
+                "open": round(float(row["Open"]), 5),
+                "high": round(float(row["High"]), 5),
+                "low": round(float(row["Low"]), 5),
+                "close": round(float(row["Close"]), 5),
+                "volume": int(row.get("Volume", 0))
+            })
+
+        logger.info(f"Fetched {len(candles)} candles for {gainedge_symbol} ({yahoo_ticker})")
+        return candles
+
+    except Exception as e:
+        logger.error(f"Yahoo Finance error for {gainedge_symbol}: {e}")
+        return []
+
+
+def store_candles_in_supabase(candles: list) -> int:
+    """Bulk insert candles into candle_history table."""
+    if not candles:
+        return 0
+
+    stored = 0
+    # Insert in batches of 100
+    for i in range(0, len(candles), 100):
+        batch = candles[i:i+100]
+        url = f"{SUPABASE_URL}/rest/v1/candle_history"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=ignore-duplicates,return=minimal"
+        }
+        resp = requests.post(url, headers=headers, json=batch)
+        if resp.status_code in (200, 201):
+            stored += len(batch)
+        else:
+            logger.error(f"Supabase insert error: {resp.status_code} {resp.text}")
+
+    return stored
+
+
+@app.route("/ingest/symbol", methods=["POST"])
+def ingest_symbol():
+    """
+    Fetch historical data for a single instrument from Yahoo Finance
+    and store in candle_history.
+
+    JSON body: { "symbol": "XAUUSD", "period": "1y", "interval": "1d" }
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != os.environ.get("RON_API_KEY", "gainedge-ron-2026"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    symbol = data.get("symbol", "")
+    period = data.get("period", "1y")
+    interval = data.get("interval", "1d")
+
+    candles = fetch_yahoo_history(symbol, period, interval)
+    stored = store_candles_in_supabase(candles)
+
+    return jsonify({
+        "symbol": symbol,
+        "yahoo_ticker": YAHOO_SYMBOLS.get(symbol, "unknown"),
+        "candles_fetched": len(candles),
+        "candles_stored": stored,
+        "period": period,
+        "interval": interval
+    })
+
+
+@app.route("/ingest/all", methods=["POST"])
+def ingest_all():
+    """
+    Fetch historical data for ALL mapped instruments from Yahoo Finance.
+    This is the big one — populates RON's brain with years of data.
+
+    JSON body: { "period": "2y", "interval": "1d" }
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != os.environ.get("RON_API_KEY", "gainedge-ron-2026"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json() or {}
+    period = data.get("period", "1y")
+    interval = data.get("interval", "1d")
+
+    results = {}
+    total_candles = 0
+
+    for symbol in YAHOO_SYMBOLS.keys():
+        candles = fetch_yahoo_history(symbol, period, interval)
+        stored = store_candles_in_supabase(candles)
+        results[symbol] = {
+            "fetched": len(candles),
+            "stored": stored
+        }
+        total_candles += stored
+        logger.info(f"Ingested {symbol}: {stored} candles")
+
+    # Log the ingestion event
+    supabase_insert("insights", {
+        "insight_type": "ron_data_ingestion",
+        "title": "Yahoo Finance Bulk Ingestion",
+        "description": json.dumps({
+            "total_candles": total_candles,
+            "instruments": len(results),
+            "period": period,
+            "interval": interval,
+            "results": results
+        }),
+        "created_at": datetime.utcnow().isoformat()
+    })
+
+    return jsonify({
+        "status": "complete",
+        "total_candles_stored": total_candles,
+        "instruments_processed": len(results),
+        "period": period,
+        "interval": interval,
+        "details": results
+    })
+
+
+@app.route("/ingest/available", methods=["GET"])
+def ingest_available():
+    """List all instruments available for Yahoo Finance ingestion."""
+    return jsonify({
+        "instruments": [
+            {"gainedge_symbol": k, "yahoo_ticker": v}
+            for k, v in YAHOO_SYMBOLS.items()
+        ],
+        "total": len(YAHOO_SYMBOLS),
+        "periods": ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"],
+        "intervals": ["1m", "5m", "15m", "1h", "1d", "1wk", "1mo"]
+    })
+
+
+@app.route("/ingest/economic-calendar", methods=["POST"])
+def ingest_economic_calendar():
+    """
+    Fetch upcoming economic events from Finnhub and store them.
+    RON uses this to know when high-impact events are coming.
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != os.environ.get("RON_API_KEY", "gainedge-ron-2026"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    finnhub_key = os.environ.get("FINNHUB_API_KEY", "d0mlsg1r01qqqs5aa4h0d0mlsg1r01qqqs5aa4hg")
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    next_week = (datetime.utcnow() + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    try:
+        resp = requests.get(
+            f"https://finnhub.io/api/v1/calendar/economic",
+            params={"from": today, "to": next_week, "token": finnhub_key}
+        )
+        if resp.status_code == 200:
+            events = resp.json().get("economicCalendar", [])
+
+            # Filter high-impact events
+            high_impact = [e for e in events if e.get("impact", 0) >= 2]
+
+            return jsonify({
+                "total_events": len(events),
+                "high_impact_events": len(high_impact),
+                "events": high_impact[:20]  # Top 20 high impact
+            })
+    except Exception as e:
+        logger.error(f"Finnhub calendar error: {e}")
+
+    return jsonify({"error": "Failed to fetch calendar"}), 500
+
+
 # ─── Main ────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
