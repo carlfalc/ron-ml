@@ -892,6 +892,180 @@ def full_briefing():
     return jsonify(briefing)
 
 
+# ─── GitHub CSV Historical Data Ingestion ─────────────────────
+GITHUB_CSV_REPO = "https://raw.githubusercontent.com/carlfalc/ron-ml/main"
+
+# Map Dukascopy file prefixes to GAINEDGE symbols
+DUKASCOPY_SYMBOL_MAP = {
+    "XAU-USD": "XAUUSD",
+    "XAU-AUD": "XAUAUD",
+    "XAG-USD": "XAGUSD",
+    "USD-CAD": "USDCAD",
+    "USD-JPY": "USDJPY",
+    "USA500IDX-USD": "US500",
+    "NZD-USD": "NZDUSD",
+    "AUD-USD": "AUDUSD",
+    "EUR-USD": "EURUSD",
+    "GBP-USD": "GBPUSD",
+    "GBP-JPY": "GBPJPY",
+    "EUR-JPY": "EURJPY",
+}
+
+
+def parse_dukascopy_csv(csv_text: str, symbol: str) -> list:
+    """Parse Dukascopy CSV format into candle records."""
+    candles = []
+    lines = csv_text.strip().split("\n")
+
+    for line in lines:
+        try:
+            parts = line.strip().split(",")
+            if len(parts) < 6:
+                continue
+            # Skip header rows
+            if parts[0].startswith("time") or parts[0].startswith("Time") or parts[0].startswith("date"):
+                continue
+
+            timestamp = parts[0].strip()
+            open_p = float(parts[1].strip())
+            high_p = float(parts[2].strip())
+            low_p = float(parts[3].strip())
+            close_p = float(parts[4].strip())
+            volume = int(float(parts[5].strip())) if parts[5].strip() else 0
+
+            # Skip zero-price candles
+            if open_p == 0 or close_p == 0:
+                continue
+
+            candles.append({
+                "symbol": symbol,
+                "timeframe": "1m",
+                "timestamp": timestamp,
+                "open": round(open_p, 5),
+                "high": round(high_p, 5),
+                "low": round(low_p, 5),
+                "close": round(close_p, 5),
+                "volume": volume
+            })
+        except (ValueError, IndexError) as e:
+            continue
+
+    return candles
+
+
+@app.route("/ingest/github-csv", methods=["POST"])
+def ingest_github_csv():
+    """
+    Fetch a specific CSV file from the ron-ml GitHub repo and import into candle_history.
+    JSON body: { "filename": "XAU-USD_Minute_2016-01-01_UTC.csv" }
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != os.environ.get("RON_API_KEY", "gainedge-ron-2026"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    filename = data.get("filename", "")
+    if not filename:
+        return jsonify({"error": "No filename provided"}), 400
+
+    # Determine GAINEDGE symbol from filename
+    symbol = None
+    for prefix, sym in DUKASCOPY_SYMBOL_MAP.items():
+        if filename.startswith(prefix):
+            symbol = sym
+            break
+
+    if not symbol:
+        return jsonify({"error": f"Cannot determine symbol from filename: {filename}"}), 400
+
+    # Fetch CSV from GitHub
+    url = f"{GITHUB_CSV_REPO}/{filename}"
+    logger.info(f"Fetching {url}")
+
+    try:
+        resp = requests.get(url, timeout=120)
+        if resp.status_code != 200:
+            return jsonify({"error": f"Failed to fetch {filename}: {resp.status_code}"}), 400
+
+        candles = parse_dukascopy_csv(resp.text, symbol)
+        logger.info(f"Parsed {len(candles)} candles from {filename}")
+
+        stored = store_candles_in_supabase(candles)
+
+        return jsonify({
+            "filename": filename,
+            "symbol": symbol,
+            "candles_parsed": len(candles),
+            "candles_stored": stored
+        })
+
+    except Exception as e:
+        logger.error(f"GitHub CSV ingestion error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/ingest/github-all", methods=["POST"])
+def ingest_all_github_csvs():
+    """
+    Fetch ALL CSV files from the ron-ml GitHub repo and import them.
+    This loads all historical Dukascopy data into RON's brain.
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != os.environ.get("RON_API_KEY", "gainedge-ron-2026"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # List known CSV files from the repo
+    csv_files = []
+    try:
+        resp = requests.get("https://api.github.com/repos/carlfalc/ron-ml/contents/",
+            headers={"Accept": "application/vnd.github.v3+json"})
+        if resp.status_code == 200:
+            for item in resp.json():
+                if item.get("name", "").endswith(".csv"):
+                    csv_files.append(item["name"])
+    except Exception as e:
+        logger.error(f"GitHub API error: {e}")
+        return jsonify({"error": "Failed to list repo files"}), 500
+
+    if not csv_files:
+        return jsonify({"error": "No CSV files found in repo"}), 404
+
+    results = {}
+    total_stored = 0
+
+    for filename in csv_files:
+        # Determine symbol
+        symbol = None
+        for prefix, sym in DUKASCOPY_SYMBOL_MAP.items():
+            if filename.startswith(prefix):
+                symbol = sym
+                break
+        if not symbol:
+            results[filename] = {"status": "skipped", "reason": "unknown symbol"}
+            continue
+
+        try:
+            url = f"{GITHUB_CSV_REPO}/{filename}"
+            resp = requests.get(url, timeout=120)
+            if resp.status_code == 200:
+                candles = parse_dukascopy_csv(resp.text, symbol)
+                stored = store_candles_in_supabase(candles)
+                results[filename] = {"symbol": symbol, "parsed": len(candles), "stored": stored}
+                total_stored += stored
+                logger.info(f"Ingested {filename}: {stored} candles for {symbol}")
+            else:
+                results[filename] = {"status": "failed", "http_code": resp.status_code}
+        except Exception as e:
+            results[filename] = {"status": "error", "message": str(e)}
+
+    return jsonify({
+        "status": "complete",
+        "total_files": len(csv_files),
+        "total_candles_stored": total_stored,
+        "details": results
+    })
+
+
 # ─── Main ────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
