@@ -897,18 +897,56 @@ GITHUB_CSV_REPO = "https://raw.githubusercontent.com/carlfalc/ron-ml/main"
 
 # Map Dukascopy file prefixes to GAINEDGE symbols
 DUKASCOPY_SYMBOL_MAP = {
+    # Metals
     "XAU-USD": "XAUUSD",
     "XAU-AUD": "XAUAUD",
     "XAG-USD": "XAGUSD",
-    "USD-CAD": "USDCAD",
-    "USD-JPY": "USDJPY",
-    "USA500IDX-USD": "US500",
-    "NZD-USD": "NZDUSD",
-    "AUD-USD": "AUDUSD",
+    # Majors
     "EUR-USD": "EURUSD",
     "GBP-USD": "GBPUSD",
-    "GBP-JPY": "GBPJPY",
+    "USD-JPY": "USDJPY",
+    "USD-CHF": "USDCHF",
+    "USD-CAD": "USDCAD",
+    "AUD-USD": "AUDUSD",
+    "NZD-USD": "NZDUSD",
+    # Crosses
+    "EUR-GBP": "EURGBP",
     "EUR-JPY": "EURJPY",
+    "EUR-AUD": "EURAUD",
+    "EUR-CAD": "EURCAD",
+    "EUR-CHF": "EURCHF",
+    "EUR-NZD": "EURNZD",
+    "GBP-JPY": "GBPJPY",
+    "GBP-AUD": "GBPAUD",
+    "GBP-CAD": "GBPCAD",
+    "GBP-CHF": "GBPCHF",
+    "GBP-NZD": "GBPNZD",
+    "AUD-JPY": "AUDJPY",
+    "AUD-CAD": "AUDCAD",
+    "AUD-CHF": "AUDCHF",
+    "AUD-NZD": "AUDNZD",
+    "NZD-JPY": "NZDJPY",
+    "NZD-CAD": "NZDCAD",
+    "NZD-CHF": "NZDCHF",
+    "CAD-JPY": "CADJPY",
+    "CAD-CHF": "CADCHF",
+    "CHF-JPY": "CHFJPY",
+    # Commodities
+    "LIGHT.CMD-USD": "USOIL",
+    "LIGHT-USD": "USOIL",
+    "BRENT.CMD-USD": "UKOIL",
+    "GAS.CMD-USD": "XNGUSD",
+    "COPPER.CMD-USD": "XCUUSD",
+    # Indices
+    "USA500.IDX-USD": "US500",
+    "USA500IDX-USD": "US500",
+    "USA30.IDX-USD": "US30",
+    "USATECH.IDX-USD": "NAS100",
+    "JPN.IDX-JPY": "JP225",
+    "GER.IDX-EUR": "GER40",
+    "GBR.IDX-GBP": "UK100",
+    "HKG.IDX-HKD": "HK50",
+    "AUS.IDX-AUD": "AUS200",
 }
 
 
