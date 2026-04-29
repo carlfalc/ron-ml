@@ -385,6 +385,83 @@ def predict():
     return jsonify(result)
 
 
+@app.route("/predict-v2", methods=["POST"])
+def predict_v2():
+    """
+    PCF (Precision Confluence v2) enhanced prediction.
+
+    Extends /predict with explicit PCF filter flags that adjust the base ML
+    probability before deciding whether RON should EXECUTE or HOLD.
+
+    PCF-specific fields (bool):
+        ema_stack_aligned  EMA8 > EMA21 and price correct side of EMA50
+        htf_aligned        1H EMA9/21 confirm the 15m direction
+        adx_above_20       ADX(14) >= 20 at entry
+        rsi_in_zone        RSI in PCF zone (BUY 45-72 / SELL 28-55)
+        in_session         London or NY session active
+
+    Optional:
+        min_probability    float threshold for EXECUTE action (default 0.65)
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON body provided"}), 400
+
+    base_result = predict_win_probability(data)
+    base_prob = base_result["probability"]
+
+    adx_val = float(data.get("adx_at_entry", 0))
+    pcf_filters = {
+        "ema_stack_aligned": bool(data.get("ema_stack_aligned", False)),
+        "htf_aligned":       bool(data.get("htf_aligned", False)),
+        "adx_above_20":      bool(data.get("adx_above_20", adx_val >= 20)),
+        "rsi_in_zone":       bool(data.get("rsi_in_zone", False)),
+        "in_session":        bool(data.get("in_session", False)),
+    }
+
+    # Each passing filter boosts probability; each failing filter penalises
+    FILTER_WEIGHTS = {
+        "ema_stack_aligned": (0.05, -0.05),
+        "htf_aligned":       (0.05, -0.05),
+        "adx_above_20":      (0.03, -0.03),
+        "rsi_in_zone":       (0.03, -0.03),
+        "in_session":        (0.02, -0.02),
+    }
+
+    adjustment = 0.0
+    filter_detail = {}
+    for fname, passes in pcf_filters.items():
+        boost, penalty = FILTER_WEIGHTS[fname]
+        delta = boost if passes else penalty
+        adjustment += delta
+        filter_detail[fname] = {"pass": passes, "adjustment": round(delta, 4)}
+
+    adjusted_prob = round(min(max(base_prob + adjustment, 0.0), 1.0), 4)
+    filters_all_pass = all(pcf_filters.values())
+    min_prob = float(data.get("min_probability", 0.65))
+    ron_action = "EXECUTE" if (adjusted_prob >= min_prob and filters_all_pass) else "HOLD"
+
+    if adjusted_prob >= 0.75:
+        label = "HIGH CONVICTION"
+    elif adjusted_prob >= 0.65:
+        label = "MODERATE"
+    elif adjusted_prob >= 0.50:
+        label = "LOW"
+    else:
+        label = "AVOID"
+
+    return jsonify({
+        "base_probability":     base_prob,
+        "adjusted_probability": adjusted_prob,
+        "pcf_filters":          filter_detail,
+        "filters_all_pass":     filters_all_pass,
+        "ron_action":           ron_action,
+        "confidence_label":     label,
+        "min_probability":      min_prob,
+        "model_available":      base_result.get("model_available", False),
+    })
+
+
 @app.route("/feature-importance", methods=["GET"])
 def feature_importance():
     """Return the trained model's feature importance ranking."""
