@@ -462,6 +462,289 @@ def predict_v2():
     })
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DLO + SQUEEZE + HEIKIN ASHI ENGINE  (predict-v3)
+# Replicates the Pine Script DLO+Squeeze Combined v3 + EMA 12/69 server-side.
+# No session rules applied here — caller controls session toggling.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _rma(series: pd.Series, period: int) -> pd.Series:
+    """Wilder's smoothing — matches Pine Script ta.rma (alpha = 1/period)."""
+    return series.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+
+def _ema_s(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()
+
+
+def _sma_s(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period, min_periods=period).mean()
+
+
+def _dmi(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
+    """Returns (plus_di, minus_di, adx) using Wilder smoothing."""
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    up_move   = high.diff()
+    down_move = -low.diff()
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0),   up_move.fillna(0),   0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move.fillna(0), 0.0)
+
+    tr_s       = _rma(tr.fillna(0), period)
+    plus_di    = 100 * _rma(pd.Series(plus_dm,  index=high.index), period) / tr_s
+    minus_di   = 100 * _rma(pd.Series(minus_dm, index=high.index), period) / tr_s
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0)
+    adx = _rma(dx, period)
+    return plus_di, minus_di, adx
+
+
+def _logistic_prob(series: pd.Series, lookback: int, slope: float, smooth: int) -> pd.Series:
+    mean = _sma_s(series, lookback)
+    z    = (series - mean) * slope
+    raw  = 1.0 / (1.0 + np.exp(-z.clip(-20, 20)))
+    return _ema_s(raw, smooth)
+
+
+def _tanh_series(x: pd.Series) -> pd.Series:
+    e2x = np.exp((2 * x).clip(-40, 40))
+    return (e2x - 1) / (e2x + 1)
+
+
+def _linreg_rolling(series: pd.Series, length: int) -> pd.Series:
+    """Rolling linear regression value at the last point of each window."""
+    vals   = series.values.astype(float)
+    result = np.full(len(vals), np.nan)
+    x      = np.arange(length, dtype=float)
+    xm     = x.mean()
+    xvar   = np.dot(x - xm, x - xm)
+    for i in range(length - 1, len(vals)):
+        y = vals[i - length + 1: i + 1]
+        if np.any(np.isnan(y)):
+            continue
+        ym    = y.mean()
+        slope = np.dot(x - xm, y - ym) / xvar
+        result[i] = ym + slope * (length - 1 - xm)
+    return pd.Series(result, index=series.index)
+
+
+def _calc_dlo(high, low, close,
+              di_len=14, mean_lb=360, slope=0.18,
+              smooth_len=3, osc_scale=2.5, osc_smooth_len=7):
+    plus_di, minus_di, adx = _dmi(high, low, close, di_len)
+    prob_p   = _logistic_prob(plus_di,  mean_lb, slope, smooth_len)
+    prob_m   = _logistic_prob(minus_di, mean_lb, slope, smooth_len)
+    prob_adx = _logistic_prob(adx,      mean_lb, slope, smooth_len)
+    strength = (prob_p - prob_m) * prob_adx * osc_scale
+    dlo      = _ema_s(_tanh_series(strength), smooth_len)
+    dlo_sm   = _ema_s(dlo, osc_smooth_len)
+    return dlo, dlo_sm
+
+
+def _calc_squeeze(close, high, low,
+                  bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
+    basis    = _sma_s(close, bb_len)
+    bb_dev   = bb_mult * close.rolling(bb_len, min_periods=bb_len).std(ddof=0)
+    upper_bb = basis + bb_dev
+    lower_bb = basis - bb_dev
+
+    prev_c = close.shift(1)
+    tr     = pd.concat([high - low,
+                        (high - prev_c).abs(),
+                        (low  - prev_c).abs()], axis=1).max(axis=1)
+    ma_kc    = _sma_s(close, kc_len)
+    rng_ma   = _sma_s(tr, kc_len)
+    upper_kc = ma_kc + rng_ma * kc_mult
+    lower_kc = ma_kc - rng_ma * kc_mult
+
+    sqz_on  = (lower_bb > lower_kc) & (upper_bb < upper_kc)
+    sqz_off = (lower_bb < lower_kc) & (upper_bb > upper_kc)
+
+    mid     = (high.rolling(kc_len).max() + low.rolling(kc_len).min()) / 2
+    mid     = (mid + _sma_s(close, kc_len)) / 2
+    sqz_val = _linreg_rolling(close - mid, kc_len)
+    return sqz_on, sqz_off, sqz_val
+
+
+def _calc_heikin_ashi(open_, high, low, close):
+    ha_close_vals = ((open_ + high + low + close) / 4.0).values
+    ha_open_vals  = np.zeros(len(open_))
+    ha_open_vals[0] = (open_.iloc[0] + close.iloc[0]) / 2.0
+    for i in range(1, len(ha_open_vals)):
+        ha_open_vals[i] = (ha_open_vals[i - 1] + ha_close_vals[i - 1]) / 2.0
+    ha_open  = pd.Series(ha_open_vals,  index=open_.index)
+    ha_close = pd.Series(ha_close_vals, index=open_.index)
+    ha_high  = pd.concat([high, ha_open, ha_close], axis=1).max(axis=1)
+    ha_low   = pd.concat([low,  ha_open, ha_close], axis=1).min(axis=1)
+    return ha_open, ha_high, ha_low, ha_close
+
+
+@app.route("/predict-v3", methods=["POST"])
+def predict_v3():
+    """
+    DLO + Squeeze Momentum + Heikin Ashi + EMA 12/69 signal engine.
+
+    Replicates the DLO+Squeeze Combined v3 Pine Script fully server-side.
+    No session filtering applied — RON fires on signal quality alone.
+    Sessions are toggled externally (Lovable UI / ron_settings).
+
+    Required body fields:
+        bars  — list of [timestamp, open, high, low, close, volume]
+                (at least 100 bars; 400+ recommended for full DLO warm-up)
+
+    Optional:
+        htf_bars          — 1H OHLCV bars for EMA 69 HTF bias (list, same format)
+        min_tier          — "A" | "B" | "C"  (default "B")
+        conviction_threshold   — A-tier DLO floor (default 0.25)
+        min_b_conviction       — B-tier DLO floor (default 0.15)
+        fire_lookback          — bars since squeeze fired (default 10)
+        require_squeeze_fire   — bool, A-tier requires squeeze fire (default true)
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON body"}), 400
+
+    bars = data.get("bars")
+    if not bars or len(bars) < 50:
+        return jsonify({"error": "Need at least 50 OHLCV bars", "min_bars": 50,
+                        "provided": len(bars) if bars else 0}), 400
+
+    # ── Build DataFrame ──────────────────────────────────────────────────────
+    df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    n = len(df)
+
+    # ── Parameters ───────────────────────────────────────────────────────────
+    conviction_a        = float(data.get("conviction_threshold", 0.25))
+    conviction_b        = float(data.get("min_b_conviction", 0.15))
+    fire_lookback       = int(data.get("fire_lookback", 10))
+    min_tier            = str(data.get("min_tier", "B")).upper()
+    require_sqz_fire    = bool(data.get("require_squeeze_fire", True))
+    mean_lb             = min(360, max(20, n - 30))
+
+    # ── HTF bias (optional 1H bars → EMA 69) ────────────────────────────────
+    htf_bias = "NEUTRAL"
+    htf_bars = data.get("htf_bars")
+    if htf_bars and len(htf_bars) >= 70:
+        htf_df = pd.DataFrame(htf_bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        htf_df["close"] = pd.to_numeric(htf_df["close"], errors="coerce")
+        htf_df = htf_df.sort_values("timestamp").reset_index(drop=True)
+        htf_ema69 = _ema_s(htf_df["close"], 69).iloc[-1]
+        last_htf  = htf_df["close"].iloc[-1]
+        if not np.isnan(htf_ema69):
+            htf_bias = "BULL" if last_htf > htf_ema69 else "BEAR"
+
+    # ── Indicators ───────────────────────────────────────────────────────────
+    dlo_s, _          = _calc_dlo(df["high"], df["low"], df["close"], mean_lb=mean_lb)
+    sqz_on, sqz_off, sqz_val = _calc_squeeze(df["close"], df["high"], df["low"])
+    _, _, _, ha_close = _calc_heikin_ashi(df["open"], df["high"], df["low"], df["close"])
+    ha_bull_series    = ha_close > df.apply(lambda r: (r["open"] + r["high"] + r["low"] + r["close"]) / 4 * 0, axis=1)
+    # Recompute ha_open properly for ha_bull
+    ha_open_vals  = np.zeros(n)
+    ha_close_vals = ((df["open"] + df["high"] + df["low"] + df["close"]) / 4.0).values
+    ha_open_vals[0] = (df["open"].iloc[0] + df["close"].iloc[0]) / 2.0
+    for i in range(1, n):
+        ha_open_vals[i] = (ha_open_vals[i - 1] + ha_close_vals[i - 1]) / 2.0
+    ha_bull_series = pd.Series(ha_close_vals > ha_open_vals, index=df.index)
+
+    ema12 = _ema_s(df["close"], 12)
+    ema69 = _ema_s(df["close"], 69)
+
+    # ── Last-bar values ──────────────────────────────────────────────────────
+    cur_dlo       = float(dlo_s.iloc[-1])
+    prev_dlo      = float(dlo_s.iloc[-2])
+    prev2_dlo     = float(dlo_s.iloc[-3])
+    cur_sqz_val   = float(sqz_val.iloc[-1])
+    prev_sqz_val  = float(sqz_val.iloc[-2])
+    cur_sqz_on    = bool(sqz_on.iloc[-1])
+    cur_sqz_off   = bool(sqz_off.iloc[-1])
+    cur_ha_bull   = bool(ha_bull_series.iloc[-1])
+    prev_ha_bull  = bool(ha_bull_series.iloc[-2])
+    cur_ema12     = float(ema12.iloc[-1])
+    cur_ema69     = float(ema69.iloc[-1])
+
+    if any(np.isnan(v) for v in [cur_dlo, cur_sqz_val, cur_ema12, cur_ema69]):
+        return jsonify({"error": "Insufficient bars for indicator warm-up",
+                        "bars_provided": n, "mean_lb_used": mean_lb}), 400
+
+    # ── Derived states ───────────────────────────────────────────────────────
+    dlo_rising   = cur_dlo  > prev_dlo  > prev2_dlo
+    dlo_falling  = cur_dlo  < prev_dlo  < prev2_dlo
+    sqz_accel_up = cur_sqz_val > 0 and cur_sqz_val > prev_sqz_val
+    sqz_accel_dn = cur_sqz_val < 0 and cur_sqz_val < prev_sqz_val
+    sqz_decel_up = cur_sqz_val > 0 and cur_sqz_val < prev_sqz_val
+    sqz_decel_dn = cur_sqz_val < 0 and cur_sqz_val > prev_sqz_val
+    ha_transition = cur_ha_bull != prev_ha_bull
+
+    # Squeeze "just fired": currently sqz_off AND sqz_on was true recently
+    sqz_just_fired = False
+    if cur_sqz_off and n > fire_lookback + 1:
+        sqz_just_fired = bool(sqz_on.iloc[-(fire_lookback + 1):-1].any())
+    squeeze_state = "ON" if cur_sqz_on else ("FIRED" if sqz_just_fired else "OFF")
+
+    # ── Signal tiers (matching Pine Script logic) ────────────────────────────
+    bull_aligned = cur_dlo > 0 and cur_sqz_val > 0
+    bear_aligned = cur_dlo < 0 and cur_sqz_val < 0
+
+    sqz_fire_ok = sqz_just_fired if require_sqz_fire else True
+
+    a_bull = bull_aligned and cur_dlo >  conviction_a and sqz_accel_up and sqz_fire_ok
+    a_bear = bear_aligned and cur_dlo < -conviction_a and sqz_accel_dn and sqz_fire_ok
+    b_bull = bull_aligned and sqz_accel_up and dlo_rising  and cur_dlo >  conviction_b and not a_bull
+    b_bear = bear_aligned and sqz_accel_dn and dlo_falling and cur_dlo < -conviction_b and not a_bear
+    c_bull = (cur_dlo > 0 and prev_dlo <= 0 and cur_sqz_val > prev_sqz_val) and not a_bull and not b_bull
+    c_bear = (cur_dlo < 0 and prev_dlo >= 0 and cur_sqz_val < prev_sqz_val) and not a_bear and not b_bear
+
+    exit_long  = (cur_dlo > 0 and sqz_decel_up) or (cur_dlo < 0 and prev_dlo >= 0)
+    exit_short = (cur_dlo < 0 and sqz_decel_dn) or (cur_dlo > 0 and prev_dlo <= 0)
+
+    # ── Resolve direction + tier ─────────────────────────────────────────────
+    direction, tier = None, "NONE"
+    tier_order = {"A": 0, "B": 1, "C": 2}
+    min_tier_rank = tier_order.get(min_tier, 1)
+
+    if a_bull:                         direction, tier = "BUY",  "A"
+    elif a_bear:                       direction, tier = "SELL", "A"
+    elif b_bull and min_tier_rank >= 1: direction, tier = "BUY",  "B"
+    elif b_bear and min_tier_rank >= 1: direction, tier = "SELL", "B"
+    elif c_bull and min_tier_rank >= 2: direction, tier = "BUY",  "C"
+    elif c_bear and min_tier_rank >= 2: direction, tier = "SELL", "C"
+
+    # HA must agree with signal direction (candle color confirmation)
+    ha_confirms = (direction == "BUY" and cur_ha_bull) or (direction == "SELL" and not cur_ha_bull)
+    ron_action  = "EXECUTE" if (direction is not None and ha_confirms) else "HOLD"
+
+    label_map   = {"A": "HIGH CONVICTION", "B": "MODERATE", "C": "LOW", "NONE": "AVOID"}
+
+    return jsonify({
+        "signal":            direction or "HOLD",
+        "ron_action":        ron_action,
+        "tier":              tier,
+        "confidence_label":  label_map.get(tier, "AVOID"),
+        "dlo":               round(cur_dlo, 4),
+        "squeeze_state":     squeeze_state,
+        "sqz_val":           round(cur_sqz_val, 6),
+        "ha_bullish":        cur_ha_bull,
+        "ha_transition":     ha_transition,
+        "ema12":             round(cur_ema12, 5),
+        "ema69":             round(cur_ema69, 5),
+        "ema_bull":          bool(cur_ema12 > cur_ema69),
+        "htf_bias":          htf_bias,
+        "exit_long":         exit_long,
+        "exit_short":        exit_short,
+        "bars_used":         n,
+        "mean_lb_used":      mean_lb,
+    })
+
+
 @app.route("/feature-importance", methods=["GET"])
 def feature_importance():
     """Return the trained model's feature importance ranking."""
