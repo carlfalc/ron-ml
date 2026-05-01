@@ -12,6 +12,7 @@ Deploy to: Render.com ($7/month)
 import os
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -1461,6 +1462,530 @@ def ingest_all_github_csvs():
         "total_files": len(csv_files),
         "total_candles_stored": total_stored,
         "details": results
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# /backtest — Historical RON v3 backtest with IS/OOS split
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_candles_range(symbol: str, timeframe: str, start_iso: str, end_iso: str,
+                          page_size: int = 1000) -> list:
+    """Paginated fetch of candle_history rows in a date range. Uses list-of-tuples
+    params so we can filter `timestamp` twice (gte + lt)."""
+    url = f"{SUPABASE_URL}/rest/v1/candle_history"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    all_rows = []
+    offset = 0
+    while True:
+        params = [
+            ("select",    "timestamp,open,high,low,close,volume"),
+            ("symbol",    f"eq.{symbol}"),
+            ("timeframe", f"eq.{timeframe}"),
+            ("timestamp", f"gte.{start_iso}"),
+            ("timestamp", f"lt.{end_iso}"),
+            ("order",     "timestamp.asc"),
+            ("limit",     str(page_size)),
+            ("offset",    str(offset)),
+        ]
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        if resp.status_code != 200:
+            logger.error(f"Supabase fetch failed: {resp.status_code} {resp.text[:200]}")
+            break
+        rows = resp.json()
+        if not rows:
+            break
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return all_rows
+
+
+def _aggregate_ohlcv(df_1m: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample 1-minute bars to a higher timeframe (e.g. '15min', '1h')."""
+    df = df_1m.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.set_index("timestamp").sort_index()
+    agg = df.resample(rule, label="left", closed="left").agg({
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"]).reset_index()
+    return agg
+
+
+def _compute_indicators_full(df: pd.DataFrame, mean_lb: int = 360):
+    """Compute DLO, Squeeze, HA, EMA12/69 once on the full series — no look-ahead
+    since each indicator value at index i depends only on data up to i."""
+    high  = df["high"]
+    low   = df["low"]
+    close = df["close"]
+    open_ = df["open"]
+
+    dlo_s, _              = _calc_dlo(high, low, close, mean_lb=mean_lb)
+    sqz_on, sqz_off, sqz_val = _calc_squeeze(close, high, low)
+
+    ha_close_vals = ((open_ + high + low + close) / 4.0).values
+    ha_open_vals  = np.zeros(len(df))
+    ha_open_vals[0] = (open_.iloc[0] + close.iloc[0]) / 2.0
+    for i in range(1, len(df)):
+        ha_open_vals[i] = (ha_open_vals[i - 1] + ha_close_vals[i - 1]) / 2.0
+    ha_bull = pd.Series(ha_close_vals > ha_open_vals, index=df.index)
+
+    ema12 = _ema_s(close, 12)
+    ema69 = _ema_s(close, 69)
+
+    # ATR(14) — Wilder
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr14 = _rma(tr.fillna(0), 14)
+
+    return {
+        "dlo":     dlo_s,
+        "sqz_on":  sqz_on,
+        "sqz_off": sqz_off,
+        "sqz_val": sqz_val,
+        "ha_bull": ha_bull,
+        "ema12":   ema12,
+        "ema69":   ema69,
+        "atr14":   atr14,
+    }
+
+
+def _signal_at_index(ind: dict, t: int, fire_lookback: int,
+                     conviction_a: float, conviction_b: float,
+                     min_tier: str, require_sqz_fire: bool) -> dict:
+    """Compute the v3 signal using only indicator values up to index t (no peek)."""
+    if t < 2:
+        return {"signal": "HOLD", "ron_action": "HOLD", "tier": "NONE"}
+
+    cur_dlo, prev_dlo, prev2_dlo = float(ind["dlo"].iloc[t]), float(ind["dlo"].iloc[t-1]), float(ind["dlo"].iloc[t-2])
+    cur_sqz_val, prev_sqz_val    = float(ind["sqz_val"].iloc[t]), float(ind["sqz_val"].iloc[t-1])
+    cur_sqz_on  = bool(ind["sqz_on"].iloc[t])
+    cur_sqz_off = bool(ind["sqz_off"].iloc[t])
+    cur_ha_bull = bool(ind["ha_bull"].iloc[t])
+
+    if any(np.isnan(v) for v in [cur_dlo, cur_sqz_val]):
+        return {"signal": "HOLD", "ron_action": "HOLD", "tier": "NONE"}
+
+    sqz_just_fired = False
+    if cur_sqz_off and t > fire_lookback:
+        sqz_just_fired = bool(ind["sqz_on"].iloc[t-fire_lookback:t].any())
+    squeeze_state = "ON" if cur_sqz_on else ("FIRED" if sqz_just_fired else "OFF")
+
+    dlo_rising  = cur_dlo > prev_dlo > prev2_dlo
+    dlo_falling = cur_dlo < prev_dlo < prev2_dlo
+    sqz_accel_up = cur_sqz_val > 0 and cur_sqz_val > prev_sqz_val
+    sqz_accel_dn = cur_sqz_val < 0 and cur_sqz_val < prev_sqz_val
+
+    bull_aligned = cur_dlo > 0 and cur_sqz_val > 0
+    bear_aligned = cur_dlo < 0 and cur_sqz_val < 0
+    sqz_fire_ok  = sqz_just_fired if require_sqz_fire else True
+
+    a_bull = bull_aligned and cur_dlo >  conviction_a and sqz_accel_up and sqz_fire_ok
+    a_bear = bear_aligned and cur_dlo < -conviction_a and sqz_accel_dn and sqz_fire_ok
+    b_bull = bull_aligned and sqz_accel_up and dlo_rising  and cur_dlo >  conviction_b and not a_bull
+    b_bear = bear_aligned and sqz_accel_dn and dlo_falling and cur_dlo < -conviction_b and not a_bear
+
+    direction, tier = None, "NONE"
+    tier_rank = {"A": 0, "B": 1}.get(min_tier, 1)
+
+    if a_bull:                          direction, tier = "BUY",  "A"
+    elif a_bear:                        direction, tier = "SELL", "A"
+    elif b_bull and tier_rank >= 1:     direction, tier = "BUY",  "B"
+    elif b_bear and tier_rank >= 1:     direction, tier = "SELL", "B"
+
+    ha_confirms = (direction == "BUY" and cur_ha_bull) or (direction == "SELL" and not cur_ha_bull)
+    ron_action  = "EXECUTE" if (direction is not None and ha_confirms) else "HOLD"
+
+    return {
+        "signal":        direction or "HOLD",
+        "ron_action":    ron_action,
+        "tier":          tier,
+        "dlo":           round(cur_dlo, 4),
+        "squeeze_state": squeeze_state,
+        "ha_bull":       cur_ha_bull,
+    }
+
+
+def _simulate_trade(bars: pd.DataFrame, t_signal: int, direction: str,
+                    entry: float, sl: float, tp: float, max_hold: int) -> dict:
+    """Forward-scan bars looking for SL or TP hit. Conservative: SL wins ties."""
+    end_idx = min(t_signal + 1 + max_hold, len(bars) - 1)
+    for i in range(t_signal + 1, end_idx + 1):
+        bar = bars.iloc[i]
+        bar_high = float(bar["high"])
+        bar_low  = float(bar["low"])
+        if direction == "BUY":
+            sl_hit = bar_low  <= sl
+            tp_hit = bar_high >= tp
+        else:
+            sl_hit = bar_high >= sl
+            tp_hit = bar_low  <= tp
+        if sl_hit and tp_hit:
+            return {"exit": sl, "exit_idx": i, "exit_reason": "sl"}
+        if sl_hit:
+            return {"exit": sl, "exit_idx": i, "exit_reason": "sl"}
+        if tp_hit:
+            return {"exit": tp, "exit_idx": i, "exit_reason": "tp"}
+    timeout_idx = min(t_signal + max_hold, len(bars) - 1)
+    return {"exit": float(bars.iloc[timeout_idx]["close"]),
+            "exit_idx": timeout_idx, "exit_reason": "timeout"}
+
+
+def _xau_pip() -> float:
+    return 0.1
+
+
+def _xau_pip_usd_per_lot() -> float:
+    return 10.0  # $0.10 move × 100 oz/lot = $10/pip per standard lot
+
+
+def _compute_metrics(trades: list, equity_curve: list, starting_balance: float) -> dict:
+    """Build the metrics block for a slice of trades."""
+    if not trades:
+        return {
+            "total_trades": 0, "win_rate": 0, "avg_win_pips": 0, "avg_loss_pips": 0,
+            "profit_factor": 0, "max_consecutive_losses": 0, "max_drawdown_pct": 0,
+            "sharpe_ratio": 0, "final_equity": starting_balance,
+            "by_tier": {"A": {}, "B": {}},
+            "trade_duration_dist": [], "dlo_dist_at_entry": [],
+            "best_trade": None, "worst_trade": None,
+        }
+
+    pnl_usd = [t["usd"] for t in trades]
+    wins    = [t for t in trades if t["usd"] > 0]
+    losses  = [t for t in trades if t["usd"] <= 0]
+
+    win_rate = round(100 * len(wins) / len(trades), 2)
+    avg_win_pips  = round(np.mean([t["pips"] for t in wins]), 2)  if wins   else 0
+    avg_loss_pips = round(np.mean([t["pips"] for t in losses]), 2) if losses else 0
+    gross_win  = sum(t["usd"] for t in wins)
+    gross_loss = abs(sum(t["usd"] for t in losses))
+    profit_factor = round(gross_win / gross_loss, 3) if gross_loss > 0 else float("inf") if gross_win > 0 else 0
+
+    max_consec_loss = 0
+    cur_streak = 0
+    for t in trades:
+        if t["usd"] <= 0:
+            cur_streak += 1
+            max_consec_loss = max(max_consec_loss, cur_streak)
+        else:
+            cur_streak = 0
+
+    if equity_curve:
+        eq_vals = np.array([e["equity"] for e in equity_curve])
+        peak = np.maximum.accumulate(eq_vals)
+        dd = (peak - eq_vals) / peak
+        max_dd_pct = round(100 * float(dd.max()), 2)
+        final_equity = round(float(eq_vals[-1]), 2)
+        rets = np.diff(eq_vals) / eq_vals[:-1]
+        sharpe = 0
+        if len(rets) > 1 and rets.std() > 0:
+            sharpe = round(float(rets.mean() / rets.std() * np.sqrt(252)), 3)
+    else:
+        max_dd_pct = 0
+        final_equity = starting_balance
+        sharpe = 0
+
+    def tier_metrics(tier_letter: str) -> dict:
+        ts = [t for t in trades if t["tier"] == tier_letter]
+        if not ts: return {"total_trades": 0, "win_rate": 0, "profit_factor": 0, "avg_pips": 0}
+        ws = [t for t in ts if t["usd"] > 0]
+        ls = [t for t in ts if t["usd"] <= 0]
+        gw = sum(t["usd"] for t in ws)
+        gl = abs(sum(t["usd"] for t in ls))
+        return {
+            "total_trades": len(ts),
+            "win_rate":     round(100 * len(ws) / len(ts), 2),
+            "profit_factor": round(gw / gl, 3) if gl > 0 else float("inf") if gw > 0 else 0,
+            "avg_pips":     round(np.mean([t["pips"] for t in ts]), 2),
+        }
+
+    duration_buckets = [(0, 4), (4, 12), (12, 24), (24, 96)]
+    dur_dist = []
+    for lo, hi in duration_buckets:
+        count = sum(1 for t in trades if lo <= t["duration_bars"] / 4 < hi)
+        dur_dist.append({"bucket": f"{lo}-{hi}h", "count": count})
+
+    dlo_buckets = [(i / 10, (i + 1) / 10) for i in range(-5, 5)]
+    dlo_dist = []
+    for lo, hi in dlo_buckets:
+        in_bucket = [t for t in trades if lo <= t["dlo"] < hi]
+        dlo_dist.append({
+            "bucket": f"{lo:.1f}-{hi:.1f}",
+            "count":  len(in_bucket),
+            "by_tier": {
+                "A": sum(1 for t in in_bucket if t["tier"] == "A"),
+                "B": sum(1 for t in in_bucket if t["tier"] == "B"),
+            },
+        })
+
+    best  = max(trades, key=lambda t: t["usd"])
+    worst = min(trades, key=lambda t: t["usd"])
+
+    return {
+        "total_trades":          len(trades),
+        "win_rate":              win_rate,
+        "avg_win_pips":          avg_win_pips,
+        "avg_loss_pips":         avg_loss_pips,
+        "profit_factor":         profit_factor,
+        "max_consecutive_losses": max_consec_loss,
+        "max_drawdown_pct":      max_dd_pct,
+        "sharpe_ratio":          sharpe,
+        "final_equity":          final_equity,
+        "by_tier":               {"A": tier_metrics("A"), "B": tier_metrics("B")},
+        "trade_duration_dist":   dur_dist,
+        "dlo_dist_at_entry":     dlo_dist,
+        "best_trade":            best,
+        "worst_trade":           worst,
+    }
+
+
+def _verdict(is_metrics: dict, oos_metrics: dict, combined: dict) -> tuple:
+    """Apply Lovable's go/no-go thresholds."""
+    issues = []
+    if is_metrics["total_trades"] < 30:
+        issues.append(f"In-sample only {is_metrics['total_trades']} trades — sample too small")
+    if oos_metrics["total_trades"] < 15:
+        issues.append(f"Out-of-sample only {oos_metrics['total_trades']} trades — sample too small")
+    if is_metrics.get("win_rate", 0) <= 55:
+        issues.append(f"IS win rate {is_metrics.get('win_rate', 0)}% ≤ 55% threshold")
+    if oos_metrics.get("win_rate", 0) <= 50:
+        issues.append(f"OOS win rate {oos_metrics.get('win_rate', 0)}% ≤ 50% threshold — engine may overfit")
+    if combined.get("profit_factor", 0) <= 1.5:
+        issues.append(f"Profit factor {combined.get('profit_factor', 0)} ≤ 1.5 — try atr_tp_mult=3.0")
+    if combined.get("max_drawdown_pct", 0) > 20:
+        issues.append(f"Max drawdown {combined.get('max_drawdown_pct', 0)}% > 20% — reduce risk_per_trade_pct")
+    a_count = combined.get("by_tier", {}).get("A", {}).get("total_trades", 0)
+    if a_count < 10 and combined["total_trades"] >= 30:
+        issues.append(f"Tier A only {a_count} trades — squeeze rule may be too restrictive")
+
+    verdict = "production_ready" if not issues else "needs_tuning"
+    return verdict, issues
+
+
+@app.route("/backtest", methods=["POST"])
+def backtest():
+    """Historical RON v3 backtest. Pulls 1m candles from candle_history,
+    aggregates to 15m + 1H, runs DLO+Squeeze+HA+EMA bar-by-bar, simulates
+    trades with ATR SL/TP, returns full metrics + IS/OOS verdict."""
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != os.environ.get("RON_API_KEY", "gainedge-ron-2026"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body = request.get_json() or {}
+    symbol         = body.get("symbol", "XAUUSD")
+    timeframe      = body.get("timeframe", "15m")
+    htf_timeframe  = body.get("htf_timeframe", "1h")
+    start          = body.get("start")
+    end            = body.get("end")
+    is_split       = body.get("in_sample_split")
+    warmup_bars    = int(body.get("warmup_bars", 400))
+
+    cfg = body.get("config", {})
+    starting_balance   = float(cfg.get("starting_balance", 10000))
+    risk_pct           = float(cfg.get("risk_per_trade_pct", 1.0))
+    atr_sl_mult        = float(cfg.get("atr_sl_mult", 1.5))
+    atr_tp_mult        = float(cfg.get("atr_tp_mult", 2.5))
+    min_tier           = str(cfg.get("min_tier", "B")).upper()
+    spread_usd         = float(cfg.get("spread_usd", 0.30))
+    max_hold_bars      = int(cfg.get("max_hold_bars", 96))
+    fire_lookback      = int(cfg.get("fire_lookback", 10))
+    conviction_a       = float(cfg.get("conviction_threshold", 0.25))
+    conviction_b       = float(cfg.get("min_b_conviction", 0.15))
+    require_sqz_fire   = bool(cfg.get("require_squeeze_fire", True))
+
+    if not start or not end:
+        return jsonify({"error": "start and end required"}), 400
+    if not is_split:
+        is_split = start  # all OOS if no split specified
+
+    logger.info(f"Backtest start: {symbol} {timeframe} from {start} to {end}")
+
+    # 1. Pull 1m bars from candle_history (source of truth for granular data)
+    rows_1m = _fetch_candles_range(symbol, "1m", start, end, page_size=1000)
+    if len(rows_1m) < 1000:
+        # Try pulling pre-aggregated bars if 1m sparse
+        rows_native = _fetch_candles_range(symbol, timeframe, start, end, page_size=1000)
+        if len(rows_native) < 200:
+            return jsonify({
+                "error": "insufficient candle data",
+                "rows_1m": len(rows_1m),
+                "rows_native": len(rows_native),
+                "hint": "ingest 1m XAUUSD via /ingest/github-csv first"
+            }), 400
+        df_15m = pd.DataFrame(rows_native)
+        df_15m["timestamp"] = pd.to_datetime(df_15m["timestamp"])
+        df_15m = df_15m.sort_values("timestamp").reset_index(drop=True)
+        df_1h  = None
+    else:
+        df_1m = pd.DataFrame(rows_1m)
+        for col in ("open", "high", "low", "close", "volume"):
+            df_1m[col] = pd.to_numeric(df_1m[col], errors="coerce")
+        df_15m = _aggregate_ohlcv(df_1m, "15min")
+        df_1h  = _aggregate_ohlcv(df_1m, "1h")
+
+    n = len(df_15m)
+    if n < warmup_bars + 100:
+        return jsonify({
+            "error": "insufficient bars after aggregation",
+            "bars_15m": n,
+            "warmup_required": warmup_bars,
+        }), 400
+
+    logger.info(f"Backtest: aggregated to {n} 15m bars + {len(df_1h) if df_1h is not None else 0} 1h bars")
+
+    # 2. Compute indicators once on full series
+    mean_lb = min(360, max(20, n - 30))
+    ind = _compute_indicators_full(df_15m, mean_lb=mean_lb)
+
+    # 3. Bar-by-bar loop
+    trades = []
+    equity = starting_balance
+    equity_curve = [{"ts": str(df_15m.iloc[warmup_bars]["timestamp"]), "equity": equity}]
+
+    open_position = None  # dict with {entry_idx, direction, sl, tp, entry, lots, tier, dlo, sqz}
+
+    for t in range(warmup_bars, n - 1):
+        bar = df_15m.iloc[t]
+        ts  = bar["timestamp"]
+
+        # Close open position if SL/TP hit on current bar
+        if open_position is not None:
+            d  = open_position
+            bar_high = float(bar["high"])
+            bar_low  = float(bar["low"])
+            if d["direction"] == "BUY":
+                sl_hit = bar_low  <= d["sl"]
+                tp_hit = bar_high >= d["tp"]
+            else:
+                sl_hit = bar_high >= d["sl"]
+                tp_hit = bar_low  <= d["tp"]
+            exit_now = None; reason = None
+            if sl_hit:                       exit_now, reason = d["sl"], "sl"
+            elif tp_hit:                     exit_now, reason = d["tp"], "tp"
+            elif (t - d["entry_idx"]) >= max_hold_bars:
+                exit_now, reason = float(bar["close"]), "timeout"
+
+            if exit_now is not None:
+                pip_size = _xau_pip()
+                pip_usd  = _xau_pip_usd_per_lot()
+                if d["direction"] == "BUY":
+                    pips = (exit_now - d["entry"]) / pip_size
+                else:
+                    pips = (d["entry"] - exit_now) / pip_size
+                usd  = pips * pip_usd * d["lots"]
+                equity += usd
+                trades.append({
+                    "ts":            str(d["entry_ts"]),
+                    "exit_ts":       str(ts),
+                    "tier":          d["tier"],
+                    "direction":     d["direction"],
+                    "dlo":           d["dlo"],
+                    "squeeze":       d["sqz"],
+                    "entry":         round(d["entry"], 5),
+                    "exit":          round(exit_now, 5),
+                    "pips":          round(pips, 2),
+                    "usd":           round(usd, 2),
+                    "duration_bars": t - d["entry_idx"],
+                    "exit_reason":   reason,
+                    "lots":          d["lots"],
+                })
+                equity_curve.append({"ts": str(ts), "equity": round(equity, 2)})
+                open_position = None
+
+        # Look for new entry
+        if open_position is None:
+            sig = _signal_at_index(ind, t, fire_lookback, conviction_a, conviction_b,
+                                   min_tier, require_sqz_fire)
+            if sig["ron_action"] == "EXECUTE":
+                next_bar = df_15m.iloc[t + 1]
+                raw_entry = float(next_bar["open"])
+                direction = sig["signal"]
+                # Spread: BUY pays the ask, SELL receives the bid
+                entry = raw_entry + spread_usd if direction == "BUY" else raw_entry - spread_usd
+
+                atr_val = float(ind["atr14"].iloc[t])
+                if np.isnan(atr_val) or atr_val <= 0:
+                    continue
+                sl_dist = atr_val * atr_sl_mult
+                tp_dist = atr_val * atr_tp_mult
+                sl = entry - sl_dist if direction == "BUY" else entry + sl_dist
+                tp = entry + tp_dist if direction == "BUY" else entry - tp_dist
+
+                pip_size = _xau_pip()
+                pip_usd  = _xau_pip_usd_per_lot()
+                sl_pips  = sl_dist / pip_size
+                risk_usd = equity * (risk_pct / 100)
+                raw_lots = risk_usd / max(sl_pips * pip_usd, 1e-6)
+                lots     = max(0.01, min(0.50, round(raw_lots * 100) / 100))
+
+                open_position = {
+                    "entry_idx": t + 1,
+                    "entry_ts":  next_bar["timestamp"],
+                    "direction": direction,
+                    "entry":     entry,
+                    "sl":        round(sl, 5),
+                    "tp":        round(tp, 5),
+                    "lots":      lots,
+                    "tier":      sig["tier"],
+                    "dlo":       sig["dlo"],
+                    "sqz":       sig["squeeze_state"],
+                }
+
+    # 4. Split trades IS / OOS
+    is_split_ts = pd.to_datetime(is_split)
+    is_trades  = [t for t in trades if pd.to_datetime(t["ts"]) <  is_split_ts]
+    oos_trades = [t for t in trades if pd.to_datetime(t["ts"]) >= is_split_ts]
+
+    # Build per-slice equity curves for accurate per-slice DD/Sharpe
+    is_eq  = [e for e in equity_curve if pd.to_datetime(e["ts"]) <  is_split_ts]
+    oos_eq = [e for e in equity_curve if pd.to_datetime(e["ts"]) >= is_split_ts]
+    if not is_eq:  is_eq  = [{"ts": start, "equity": starting_balance}]
+    if not oos_eq:
+        oos_eq = [{"ts": is_split, "equity": is_eq[-1]["equity"] if is_eq else starting_balance}]
+
+    is_metrics  = _compute_metrics(is_trades,  is_eq,  starting_balance)
+    oos_metrics = _compute_metrics(oos_trades, oos_eq, is_eq[-1]["equity"] if is_eq else starting_balance)
+    combined    = _compute_metrics(trades,     equity_curve, starting_balance)
+
+    verdict, issues = _verdict(is_metrics, oos_metrics, combined)
+
+    return jsonify({
+        "run_id": str(uuid.uuid4()),
+        "config": {
+            "symbol": symbol, "timeframe": timeframe, "htf_timeframe": htf_timeframe,
+            "start": start, "end": end, "in_sample_split": is_split,
+            "warmup_bars": warmup_bars,
+            "starting_balance": starting_balance, "risk_per_trade_pct": risk_pct,
+            "atr_sl_mult": atr_sl_mult, "atr_tp_mult": atr_tp_mult,
+            "min_tier": min_tier, "spread_usd": spread_usd,
+            "max_hold_bars": max_hold_bars,
+        },
+        "data_window": {
+            "bars_used": n,
+            "earliest":  str(df_15m.iloc[0]["timestamp"]),
+            "latest":    str(df_15m.iloc[-1]["timestamp"]),
+        },
+        "in_sample":     is_metrics,
+        "out_of_sample": oos_metrics,
+        "combined":      combined,
+        "trades":        trades,
+        "equity_curve":  equity_curve,
+        "verdict":       verdict,
+        "issues":        issues,
     })
 
 
