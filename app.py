@@ -1521,9 +1521,12 @@ def _aggregate_ohlcv(df_1m: pd.DataFrame, rule: str) -> pd.DataFrame:
     return agg
 
 
-def _compute_indicators_full(df: pd.DataFrame, mean_lb: int = 360):
-    """Compute DLO, Squeeze, HA, EMA12/69 once on the full series — no look-ahead
-    since each indicator value at index i depends only on data up to i."""
+def _compute_indicators_full(df: pd.DataFrame, mean_lb: int = 360,
+                             ema_fast: int = 12, ema_slow: int = 69,
+                             candle_type: str = "HA"):
+    """Compute DLO, Squeeze, HA/standard, EMA(fast)/EMA(slow) once on the full series.
+    No look-ahead — each value at index i depends only on data up to i.
+    Defaults match V3 production (12/69 EMA, Heikin Ashi)."""
     high  = df["high"]
     low   = df["low"]
     close = df["close"]
@@ -1532,15 +1535,18 @@ def _compute_indicators_full(df: pd.DataFrame, mean_lb: int = 360):
     dlo_s, _              = _calc_dlo(high, low, close, mean_lb=mean_lb)
     sqz_on, sqz_off, sqz_val = _calc_squeeze(close, high, low)
 
-    ha_close_vals = ((open_ + high + low + close) / 4.0).values
-    ha_open_vals  = np.zeros(len(df))
-    ha_open_vals[0] = (open_.iloc[0] + close.iloc[0]) / 2.0
-    for i in range(1, len(df)):
-        ha_open_vals[i] = (ha_open_vals[i - 1] + ha_close_vals[i - 1]) / 2.0
-    ha_bull = pd.Series(ha_close_vals > ha_open_vals, index=df.index)
+    if str(candle_type).upper() == "HA":
+        ha_close_vals = ((open_ + high + low + close) / 4.0).values
+        ha_open_vals  = np.zeros(len(df))
+        ha_open_vals[0] = (open_.iloc[0] + close.iloc[0]) / 2.0
+        for i in range(1, len(df)):
+            ha_open_vals[i] = (ha_open_vals[i - 1] + ha_close_vals[i - 1]) / 2.0
+        candle_bull = pd.Series(ha_close_vals > ha_open_vals, index=df.index)
+    else:
+        candle_bull = pd.Series(close.values > open_.values, index=df.index)
 
-    ema12 = _ema_s(close, 12)
-    ema69 = _ema_s(close, 69)
+    ema_fast_s = _ema_s(close, int(ema_fast))
+    ema_slow_s = _ema_s(close, int(ema_slow))
 
     # ATR(14) — Wilder
     prev_close = close.shift(1)
@@ -1552,20 +1558,21 @@ def _compute_indicators_full(df: pd.DataFrame, mean_lb: int = 360):
     atr14 = _rma(tr.fillna(0), 14)
 
     return {
-        "dlo":     dlo_s,
-        "sqz_on":  sqz_on,
-        "sqz_off": sqz_off,
-        "sqz_val": sqz_val,
-        "ha_bull": ha_bull,
-        "ema12":   ema12,
-        "ema69":   ema69,
-        "atr14":   atr14,
+        "dlo":      dlo_s,
+        "sqz_on":   sqz_on,
+        "sqz_off":  sqz_off,
+        "sqz_val":  sqz_val,
+        "ha_bull":  candle_bull,   # name kept for compat; HA or standard per candle_type
+        "ema_fast": ema_fast_s,
+        "ema_slow": ema_slow_s,
+        "atr14":    atr14,
     }
 
 
 def _signal_at_index(ind: dict, t: int, fire_lookback: int,
                      conviction_a: float, conviction_b: float,
-                     min_tier: str, require_sqz_fire: bool) -> dict:
+                     min_tier: str, require_sqz_fire: bool,
+                     ema_filter: bool = False) -> dict:
     """Compute the v3 signal using only indicator values up to index t (no peek)."""
     if t < 2:
         return {"signal": "HOLD", "ron_action": "HOLD", "tier": "NONE"}
@@ -1575,6 +1582,9 @@ def _signal_at_index(ind: dict, t: int, fire_lookback: int,
     cur_sqz_on  = bool(ind["sqz_on"].iloc[t])
     cur_sqz_off = bool(ind["sqz_off"].iloc[t])
     cur_ha_bull = bool(ind["ha_bull"].iloc[t])
+    cur_ema_fast = float(ind["ema_fast"].iloc[t])
+    cur_ema_slow = float(ind["ema_slow"].iloc[t])
+    ema_bull = cur_ema_fast > cur_ema_slow
 
     if any(np.isnan(v) for v in [cur_dlo, cur_sqz_val]):
         return {"signal": "HOLD", "ron_action": "HOLD", "tier": "NONE"}
@@ -1607,7 +1617,10 @@ def _signal_at_index(ind: dict, t: int, fire_lookback: int,
     elif b_bear and tier_rank >= 1:     direction, tier = "SELL", "B"
 
     ha_confirms = (direction == "BUY" and cur_ha_bull) or (direction == "SELL" and not cur_ha_bull)
-    ron_action  = "EXECUTE" if (direction is not None and ha_confirms) else "HOLD"
+    ema_confirms = True
+    if ema_filter and direction is not None:
+        ema_confirms = (direction == "BUY" and ema_bull) or (direction == "SELL" and not ema_bull)
+    ron_action  = "EXECUTE" if (direction is not None and ha_confirms and ema_confirms) else "HOLD"
 
     return {
         "signal":        direction or "HOLD",
@@ -1806,6 +1819,10 @@ def backtest():
     conviction_a       = float(cfg.get("conviction_threshold", 0.25))
     conviction_b       = float(cfg.get("min_b_conviction", 0.15))
     require_sqz_fire   = bool(cfg.get("require_squeeze_fire", True))
+    ema_fast           = int(cfg.get("ema_fast", 12))      # V3 default 12
+    ema_slow           = int(cfg.get("ema_slow", 69))      # V3 default 69
+    candle_type        = str(cfg.get("candle_type", "HA")).upper()  # V3 default HA
+    ema_filter         = bool(cfg.get("ema_filter", False))         # V3 production: informational only
 
     if not start or not end:
         return jsonify({"error": "start and end required"}), 400
@@ -1847,9 +1864,11 @@ def backtest():
 
     logger.info(f"Backtest: aggregated to {n} 15m bars + {len(df_1h) if df_1h is not None else 0} 1h bars")
 
-    # 2. Compute indicators once on full series
+    # 2. Compute indicators once on full series (with optional overrides)
     mean_lb = min(360, max(20, n - 30))
-    ind = _compute_indicators_full(df_15m, mean_lb=mean_lb)
+    ind = _compute_indicators_full(df_15m, mean_lb=mean_lb,
+                                   ema_fast=ema_fast, ema_slow=ema_slow,
+                                   candle_type=candle_type)
 
     # 3. Bar-by-bar loop
     trades = []
@@ -1909,7 +1928,7 @@ def backtest():
         # Look for new entry
         if open_position is None:
             sig = _signal_at_index(ind, t, fire_lookback, conviction_a, conviction_b,
-                                   min_tier, require_sqz_fire)
+                                   min_tier, require_sqz_fire, ema_filter=ema_filter)
             if sig["ron_action"] == "EXECUTE":
                 next_bar = df_15m.iloc[t + 1]
                 raw_entry = float(next_bar["open"])
@@ -1973,6 +1992,10 @@ def backtest():
             "atr_sl_mult": atr_sl_mult, "atr_tp_mult": atr_tp_mult,
             "min_tier": min_tier, "spread_usd": spread_usd,
             "max_hold_bars": max_hold_bars,
+            "ema_fast": ema_fast, "ema_slow": ema_slow,
+            "candle_type": candle_type, "ema_filter": ema_filter,
+            "conviction_threshold": conviction_a, "min_b_conviction": conviction_b,
+            "require_squeeze_fire": require_sqz_fire,
         },
         "data_window": {
             "bars_used": n,
