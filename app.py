@@ -13,7 +13,10 @@ import os
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+import lzma
+import struct
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -2009,6 +2012,206 @@ def backtest():
         "equity_curve":  equity_curve,
         "verdict":       verdict,
         "issues":        issues,
+    })
+
+
+# ─── Dukascopy direct datafeed (no manual CSVs) ───────────────────────────
+DUKASCOPY_BASE = "https://datafeed.dukascopy.com/datafeed"
+
+# (dukascopy_symbol, point_factor)
+# point_factor: 3 means raw price / 1000;  5 means raw price / 100000
+DUKASCOPY_INSTRUMENT_MAP = {
+    "XAUUSD": ("XAUUSD", 3),
+    "XAUAUD": ("XAUAUD", 3),
+    "XAGUSD": ("XAGUSD", 3),
+    "EURUSD": ("EURUSD", 5),
+    "GBPUSD": ("GBPUSD", 5),
+    "USDJPY": ("USDJPY", 3),
+    "AUDUSD": ("AUDUSD", 5),
+    "NZDUSD": ("NZDUSD", 5),
+    "USDCAD": ("USDCAD", 5),
+    "EURJPY": ("EURJPY", 3),
+    "GBPJPY": ("GBPJPY", 3),
+    "AUDJPY": ("AUDJPY", 3),
+    "EURGBP": ("EURGBP", 5),
+    "EURNZD": ("EURNZD", 5),
+    "GBPCAD": ("GBPCAD", 5),
+    "AUDCAD": ("AUDCAD", 5),
+    "AUDNZD": ("AUDNZD", 5),
+    "NZDCAD": ("NZDCAD", 5),
+}
+
+
+def _fetch_dukascopy_hour(dk_sym: str, point_factor: int,
+                          year: int, month0: int, day: int, hour: int,
+                          timeout: int = 12) -> Optional[list]:
+    """Download one hour of tick data from Dukascopy. month0 is 0-indexed (Jan=0).
+    Returns a list of {ts_ms, bid, ask} or None on failure / empty hour."""
+    url = (f"{DUKASCOPY_BASE}/{dk_sym}/"
+           f"{year:04d}/{month0:02d}/{day:02d}/{hour:02d}h_ticks.bi5")
+    try:
+        resp = requests.get(url, timeout=timeout,
+                            headers={"User-Agent": "ron-dukascopy/1.0"})
+    except Exception:
+        return None
+    if resp.status_code != 200 or not resp.content:
+        return None
+    try:
+        decompressed = lzma.decompress(resp.content)
+    except Exception:
+        # Empty hours are sometimes 0 bytes which lzma can't decode — skip silently
+        return None
+
+    pf = 10 ** point_factor
+    hour_start_ms = int(datetime(year, month0 + 1, day, hour,
+                                  tzinfo=timezone.utc).timestamp() * 1000)
+    record_size = 20
+    ticks = []
+    for i in range(0, len(decompressed), record_size):
+        if i + record_size > len(decompressed):
+            break
+        # Big-endian: uint32 ms_offset, uint32 ask_raw, uint32 bid_raw, float32 ask_vol, float32 bid_vol
+        try:
+            offset_ms, ask_raw, bid_raw, _ask_vol, _bid_vol = struct.unpack(
+                ">IIIff", decompressed[i:i + record_size])
+        except struct.error:
+            continue
+        ticks.append({
+            "ts_ms": hour_start_ms + offset_ms,
+            "bid":   bid_raw / pf,
+            "ask":   ask_raw / pf,
+        })
+    return ticks if ticks else None
+
+
+def _ticks_to_1m_candles(ticks: list, symbol: str) -> list:
+    """Aggregate tick stream to 1m OHLCV using mid-price."""
+    if not ticks:
+        return []
+    df = pd.DataFrame(ticks)
+    df["mid"] = (df["bid"] + df["ask"]) / 2.0
+    df["timestamp"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
+    df = df.set_index("timestamp")
+    ohlc = df["mid"].resample("1min").ohlc()
+    vol  = df["mid"].resample("1min").count().rename("volume")
+    out = pd.concat([ohlc, vol], axis=1).dropna(subset=["open"])
+    candles = []
+    for ts, row in out.iterrows():
+        candles.append({
+            "symbol":    symbol,
+            "timeframe": "1m",
+            "timestamp": ts.isoformat(),
+            "open":      float(row["open"]),
+            "high":      float(row["high"]),
+            "low":       float(row["low"]),
+            "close":     float(row["close"]),
+            "volume":    int(row["volume"]),
+        })
+    return candles
+
+
+@app.route("/ingest/dukascopy-direct", methods=["POST"])
+def ingest_dukascopy_direct():
+    """Fetch 1m candles directly from Dukascopy's public datafeed and store
+    them in candle_history. No manual CSV uploads.
+
+    Body: {
+        "symbol":   "XAUUSD",          # standardized (see DUKASCOPY_INSTRUMENT_MAP)
+        "start":    "2022-01-01",      # inclusive UTC date
+        "end":      "2022-01-14",      # inclusive
+        "max_days": 31,                # safety cap, default 31
+        "skip_weekends": true          # default true
+    }
+
+    Note: Render's HTTP timeout limits how big a range can fit in one call.
+    For multi-month back-fills, call this endpoint once per chunk (~2 weeks).
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != os.environ.get("RON_API_KEY", "gainedge-ron-2026"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body = request.get_json() or {}
+    symbol         = str(body.get("symbol", "XAUUSD")).upper()
+    start          = body.get("start")
+    end            = body.get("end")
+    max_days       = int(body.get("max_days", 31))
+    skip_weekends  = bool(body.get("skip_weekends", True))
+    max_workers    = int(body.get("max_workers", 8))
+
+    if not start or not end:
+        return jsonify({"error": "start and end required (YYYY-MM-DD)"}), 400
+    if symbol not in DUKASCOPY_INSTRUMENT_MAP:
+        return jsonify({
+            "error":     "unsupported symbol",
+            "supported": list(DUKASCOPY_INSTRUMENT_MAP.keys()),
+        }), 400
+
+    dk_sym, pf = DUKASCOPY_INSTRUMENT_MAP[symbol]
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_dt   = datetime.strptime(end,   "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError as e:
+        return jsonify({"error": f"bad date format: {e}"}), 400
+
+    days = (end_dt - start_dt).days + 1
+    if days < 1:
+        return jsonify({"error": "end must be >= start"}), 400
+    if days > max_days:
+        return jsonify({
+            "error":    f"range too large: {days} days, max_days={max_days}",
+            "hint":     "split into ~14-day chunks; call /ingest/dukascopy-direct multiple times",
+        }), 400
+
+    # Build the list of hourly fetches
+    hours = []
+    cur = start_dt
+    while cur <= end_dt:
+        if skip_weekends and cur.weekday() >= 5:
+            cur += timedelta(days=1)
+            continue
+        for h in range(24):
+            hours.append((cur.year, cur.month - 1, cur.day, h))
+        cur += timedelta(days=1)
+
+    logger.info(f"Dukascopy ingest {symbol}: {days} days → {len(hours)} hourly fetches")
+
+    all_ticks = []
+    failed = 0
+
+    def worker(args):
+        y, m0, d, h = args
+        return _fetch_dukascopy_hour(dk_sym, pf, y, m0, d, h)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for ticks in pool.map(worker, hours):
+            if ticks is None:
+                failed += 1
+                continue
+            all_ticks.extend(ticks)
+
+    if not all_ticks:
+        return jsonify({
+            "error":            "no tick data downloaded",
+            "hours_requested":  len(hours),
+            "hours_failed":     failed,
+            "hint":             "check date range; weekends and market holidays return no data",
+        }), 502
+
+    all_ticks.sort(key=lambda t: t["ts_ms"])
+    candles = _ticks_to_1m_candles(all_ticks, symbol)
+    stored  = store_candles_in_supabase(candles)
+
+    return jsonify({
+        "status":             "complete",
+        "symbol":             symbol,
+        "start":              start,
+        "end":                end,
+        "days":               days,
+        "hours_requested":    len(hours),
+        "hours_failed":       failed,
+        "ticks_downloaded":   len(all_ticks),
+        "candles_aggregated": len(candles),
+        "candles_stored":     stored,
     })
 
 
