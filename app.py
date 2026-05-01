@@ -2097,17 +2097,54 @@ def _ticks_to_1m_candles(ticks: list, symbol: str) -> list:
     out = pd.concat([ohlc, vol], axis=1).dropna(subset=["open"])
     candles = []
     for ts, row in out.iterrows():
+        # Match parse_dukascopy_csv format: naive datetime string + 5dp rounding
         candles.append({
             "symbol":    symbol,
             "timeframe": "1m",
-            "timestamp": ts.isoformat(),
-            "open":      float(row["open"]),
-            "high":      float(row["high"]),
-            "low":       float(row["low"]),
-            "close":     float(row["close"]),
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "open":      round(float(row["open"]), 5),
+            "high":      round(float(row["high"]), 5),
+            "low":       round(float(row["low"]), 5),
+            "close":     round(float(row["close"]), 5),
             "volume":    int(row["volume"]),
         })
     return candles
+
+
+def _store_candles_with_diagnostics(candles: list) -> dict:
+    """Same as store_candles_in_supabase but returns first error details for debugging."""
+    if not candles:
+        return {"stored": 0, "first_error": None, "batches": 0}
+
+    stored = 0
+    first_error = None
+    batches = 0
+    for i in range(0, len(candles), 100):
+        batch = candles[i:i+100]
+        batches += 1
+        url = f"{SUPABASE_URL}/rest/v1/candle_history"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=ignore-duplicates,return=minimal"
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=batch, timeout=30)
+            if resp.status_code in (200, 201):
+                stored += len(batch)
+            else:
+                if first_error is None:
+                    first_error = {
+                        "status": resp.status_code,
+                        "body":   (resp.text or "")[:500],
+                        "first_row": batch[0] if batch else None,
+                    }
+                logger.error(f"Supabase insert error: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            if first_error is None:
+                first_error = {"exception": str(e), "first_row": batch[0] if batch else None}
+    return {"stored": stored, "first_error": first_error, "batches": batches}
 
 
 @app.route("/ingest/dukascopy-direct", methods=["POST"])
@@ -2199,7 +2236,7 @@ def ingest_dukascopy_direct():
 
     all_ticks.sort(key=lambda t: t["ts_ms"])
     candles = _ticks_to_1m_candles(all_ticks, symbol)
-    stored  = store_candles_in_supabase(candles)
+    insert_result = _store_candles_with_diagnostics(candles)
 
     return jsonify({
         "status":             "complete",
@@ -2211,7 +2248,9 @@ def ingest_dukascopy_direct():
         "hours_failed":       failed,
         "ticks_downloaded":   len(all_ticks),
         "candles_aggregated": len(candles),
-        "candles_stored":     stored,
+        "candles_stored":     insert_result["stored"],
+        "insert_batches":     insert_result["batches"],
+        "first_insert_error": insert_result["first_error"],
     })
 
 
