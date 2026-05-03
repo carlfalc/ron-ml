@@ -974,26 +974,45 @@ def fetch_yahoo_history(gainedge_symbol: str, period: str = "1y", interval: str 
 
 
 def store_candles_in_supabase(candles: list) -> int:
-    """Bulk insert candles into candle_history table."""
+    """Bulk insert candles via SECURITY DEFINER RPC (bypasses RLS with anon key).
+    Falls back to direct insert if RPC not available."""
     if not candles:
         return 0
 
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
     stored = 0
-    # Insert in batches of 100
-    for i in range(0, len(candles), 100):
-        batch = candles[i:i+100]
-        url = f"{SUPABASE_URL}/rest/v1/candle_history"
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=ignore-duplicates,return=minimal"
-        }
-        resp = requests.post(url, headers=headers, json=batch)
-        if resp.status_code in (200, 201):
-            stored += len(batch)
+
+    for i in range(0, len(candles), 500):
+        batch = candles[i:i + 500]
+        # Use SECURITY DEFINER RPC — works with anon key, bypasses RLS
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/bulk_insert_candles",
+            headers=headers,
+            json={"candles": batch},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            try:
+                stored += int(resp.json())
+            except Exception:
+                stored += len(batch)  # assume all stored if count unparseable
         else:
-            logger.error(f"Supabase insert error: {resp.status_code} {resp.text}")
+            # Fallback: direct insert (works if service_role key is set)
+            logger.warning(f"RPC insert failed ({resp.status_code}), trying direct insert")
+            direct_resp = requests.post(
+                f"{SUPABASE_URL}/rest/v1/candle_history",
+                headers={**headers, "Prefer": "resolution=ignore-duplicates,return=minimal"},
+                json=batch,
+                timeout=30,
+            )
+            if direct_resp.status_code in (200, 201, 204):
+                stored += len(batch)
+            else:
+                logger.error(f"Direct insert also failed: {direct_resp.status_code} {direct_resp.text[:200]}")
 
     return stored
 
