@@ -2227,44 +2227,72 @@ def ingest_dukascopy_direct():
             "hint":     "split into ~14-day chunks; call /ingest/dukascopy-direct multiple times",
         }), 400
 
-    # Build the list of hourly fetches
-    hours = []
+    # Build day list (skipping weekends if requested)
+    day_list = []
     cur = start_dt
     while cur <= end_dt:
-        if skip_weekends and cur.weekday() >= 5:
-            cur += timedelta(days=1)
-            continue
-        for h in range(24):
-            hours.append((cur.year, cur.month - 1, cur.day, h))
+        if not (skip_weekends and cur.weekday() >= 5):
+            day_list.append(cur)
         cur += timedelta(days=1)
 
-    logger.info(f"Dukascopy ingest {symbol}: {days} days → {len(hours)} hourly fetches")
+    logger.info(f"Dukascopy ingest {symbol}: {days} requested days, {len(day_list)} business days")
 
-    all_ticks = []
-    failed = 0
+    total_ticks = 0
+    total_candles = 0
+    total_stored = 0
+    total_hours_requested = 0
+    total_hours_failed = 0
+    first_error = None
+    import gc
 
-    def worker(args):
-        y, m0, d, h = args
-        return _fetch_dukascopy_hour(dk_sym, pf, y, m0, d, h)
+    # Process ONE DAY at a time — keeps memory bounded (~150MB peak per day vs 2GB+ for whole range)
+    for day in day_list:
+        day_hours = [(day.year, day.month - 1, day.day, h) for h in range(24)]
+        total_hours_requested += 24
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        for ticks in pool.map(worker, hours):
-            if ticks is None:
-                failed += 1
-                continue
-            all_ticks.extend(ticks)
+        day_ticks = []
 
-    if not all_ticks:
+        def worker(args):
+            y, m0, d, h = args
+            return _fetch_dukascopy_hour(dk_sym, pf, y, m0, d, h)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for ticks in pool.map(worker, day_hours):
+                if ticks is None:
+                    total_hours_failed += 1
+                    continue
+                day_ticks.extend(ticks)
+
+        if not day_ticks:
+            continue
+
+        day_ticks.sort(key=lambda t: t["ts_ms"])
+        day_candles = _ticks_to_1m_candles(day_ticks, symbol)
+
+        # Free tick memory before insert + aggregation overhead spikes
+        del day_ticks
+        gc.collect()
+
+        insert_result = _store_candles_with_diagnostics(day_candles)
+        total_ticks    += 0  # already discarded; we just track candles now
+        total_candles  += len(day_candles)
+        total_stored   += insert_result["stored"]
+        if first_error is None and insert_result["first_error"]:
+            first_error = insert_result["first_error"]
+
+        # Free candle memory before next day
+        del day_candles
+        gc.collect()
+
+        logger.info(f"Day {day.date()}: stored {insert_result['stored']} candles, running total {total_stored}")
+
+    if total_candles == 0:
         return jsonify({
             "error":            "no tick data downloaded",
-            "hours_requested":  len(hours),
-            "hours_failed":     failed,
+            "hours_requested":  total_hours_requested,
+            "hours_failed":     total_hours_failed,
             "hint":             "check date range; weekends and market holidays return no data",
         }), 502
-
-    all_ticks.sort(key=lambda t: t["ts_ms"])
-    candles = _ticks_to_1m_candles(all_ticks, symbol)
-    insert_result = _store_candles_with_diagnostics(candles)
 
     return jsonify({
         "status":             "complete",
@@ -2272,13 +2300,12 @@ def ingest_dukascopy_direct():
         "start":              start,
         "end":                end,
         "days":               days,
-        "hours_requested":    len(hours),
-        "hours_failed":       failed,
-        "ticks_downloaded":   len(all_ticks),
-        "candles_aggregated": len(candles),
-        "candles_stored":     insert_result["stored"],
-        "insert_batches":     insert_result["batches"],
-        "first_insert_error": insert_result["first_error"],
+        "business_days":      len(day_list),
+        "hours_requested":    total_hours_requested,
+        "hours_failed":       total_hours_failed,
+        "candles_aggregated": total_candles,
+        "candles_stored":     total_stored,
+        "first_insert_error": first_error,
     })
 
 
