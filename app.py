@@ -2131,39 +2131,48 @@ def _ticks_to_1m_candles(ticks: list, symbol: str) -> list:
 
 
 def _store_candles_with_diagnostics(candles: list) -> dict:
-    """Same as store_candles_in_supabase but returns first error details for debugging."""
+    """Bulk insert via SECURITY DEFINER RPC (bypasses RLS). Returns diagnostic info."""
     if not candles:
-        return {"stored": 0, "first_error": None, "batches": 0}
+        return {"stored": 0, "first_error": None, "batches": 0, "method": "none"}
 
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
     stored = 0
     first_error = None
     batches = 0
-    for i in range(0, len(candles), 100):
-        batch = candles[i:i+100]
+
+    for i in range(0, len(candles), 500):
+        batch = candles[i:i + 500]
         batches += 1
-        url = f"{SUPABASE_URL}/rest/v1/candle_history"
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=ignore-duplicates,return=minimal"
-        }
         try:
-            resp = requests.post(url, headers=headers, json=batch, timeout=30)
-            if resp.status_code in (200, 201):
-                stored += len(batch)
+            resp = requests.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/bulk_insert_candles",
+                headers=headers,
+                json={"candles": batch},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                try:
+                    stored += int(resp.json())
+                except Exception:
+                    stored += len(batch)
             else:
                 if first_error is None:
                     first_error = {
+                        "method": "rpc",
                         "status": resp.status_code,
                         "body":   (resp.text or "")[:500],
                         "first_row": batch[0] if batch else None,
                     }
-                logger.error(f"Supabase insert error: {resp.status_code} {resp.text[:200]}")
+                logger.error(f"RPC insert error: {resp.status_code} {resp.text[:200]}")
         except Exception as e:
             if first_error is None:
-                first_error = {"exception": str(e), "first_row": batch[0] if batch else None}
-    return {"stored": stored, "first_error": first_error, "batches": batches}
+                first_error = {"method": "rpc", "exception": str(e)}
+
+    return {"stored": stored, "first_error": first_error, "batches": batches, "method": "rpc"}
 
 
 @app.route("/ingest/dukascopy-direct", methods=["POST"])
